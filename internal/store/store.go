@@ -83,8 +83,9 @@ func (s *Store) WithCase(id string, fn func(*Snapshot) ([]byte, bool, error)) ([
 	if snap.Case == nil {
 		return nil, errors.New("案件快照为空")
 	}
-	head, err := s.appendAudit(id, payload)
+	head, prevSize, err := s.appendAudit(id, payload)
 	if err != nil {
+		s.rollbackAudit(id, prevSize)
 		return nil, err
 	}
 	snap.Case.AuditHead = head
@@ -92,6 +93,7 @@ func (s *Store) WithCase(id string, fn func(*Snapshot) ([]byte, bool, error)) ([
 		snap.Case.Certificate.SealAuditHead(head)
 	}
 	if err = s.writeSnapshot(id, snap); err != nil {
+		s.rollbackAudit(id, prevSize)
 		return nil, err
 	}
 	return payload, nil
@@ -129,10 +131,10 @@ func (s *Store) writeSnapshot(id string, snap *Snapshot) error {
 	}
 	return err
 }
-func (s *Store) appendAudit(id string, payload []byte) (string, error) {
+func (s *Store) appendAudit(id string, payload []byte) (head string, prevSize int64, err error) {
 	frames, err := s.readAudit(id)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	prev := ""
 	seq := int64(1)
@@ -140,23 +142,48 @@ func (s *Store) appendAudit(id string, payload []byte) (string, error) {
 		prev = frames[len(frames)-1].FrameDigest
 		seq = frames[len(frames)-1].Sequence + 1
 	}
+	info, statErr := os.Stat(s.auditPath(id))
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return "", 0, statErr
+	}
+	if info != nil {
+		prevSize = info.Size()
+	}
 	ph := sum(payload)
 	f := AuditFrame{Sequence: seq, Length: len(payload), PreviousDigest: prev, PayloadDigest: ph, Payload: payload}
 	f.FrameDigest = frameDigest(f)
 	b, _ := json.Marshal(f)
 	file, err := os.OpenFile(s.auditPath(id), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
 	if err != nil {
-		return "", err
+		return "", prevSize, err
 	}
 	if _, err = file.Write(append(b, '\n')); err != nil {
 		file.Close()
-		return "", err
+		return "", prevSize, err
 	}
 	if err = file.Sync(); err != nil {
 		file.Close()
-		return "", err
+		return "", prevSize, err
 	}
-	return f.FrameDigest, file.Close()
+	if err = file.Close(); err != nil {
+		return "", prevSize, err
+	}
+	return f.FrameDigest, prevSize, nil
+}
+
+func (s *Store) rollbackAudit(id string, prevSize int64) {
+	if prevSize <= 0 {
+		_ = os.Remove(s.auditPath(id))
+		return
+	}
+	path := s.auditPath(id)
+	if err := os.Truncate(path, prevSize); err != nil {
+		return
+	}
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
 }
 func sum(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 func frameDigest(f AuditFrame) string {

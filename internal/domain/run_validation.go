@@ -147,3 +147,47 @@ func ValidateRun(p ProtocolBaseline, run ExerciseRun) error {
 	}
 	return nil
 }
+
+// validateCrossRunEvidence checks the incoming run's evidence URI↔SHA-256
+// bindings against the accumulated bindings from every historical run already
+// recorded on the case. Both directions are verified: a URI that was bound to a
+// different digest in a prior run, and a digest that was bound to a different
+// URI, are reported as structured validation issues without mutating case
+// state.
+func (c *ExerciseCase) validateCrossRunEvidence(run ExerciseRun) error {
+	uriDigest := map[string]string{}
+	digestURI := map[string]string{}
+	for _, existing := range c.Runs {
+		for _, event := range existing.Events {
+			for _, ref := range event.EvidenceRefs {
+				ref = NormalizeEvidence(ref)
+				if ref.URI == "" || ref.SHA256 == "" {
+					continue
+				}
+				uriDigest[ref.URI] = ref.SHA256
+				digestURI[ref.SHA256] = ref.URI
+			}
+		}
+	}
+	run = NormalizeRun(run)
+	issues := []ValidationIssue{}
+	for i, event := range run.Events {
+		row := i + 1
+		for _, ref := range event.EvidenceRefs {
+			ref = NormalizeEvidence(ref)
+			if ref.URI == "" || ref.SHA256 == "" {
+				continue
+			}
+			if old, ok := uriDigest[ref.URI]; ok && old != ref.SHA256 {
+				issues = append(issues, ValidationIssue{Code: "cross_run_uri_conflict", Field: "events.evidence_refs", Row: row, Message: fmt.Sprintf("第 %d 项事件的证据 URI %s 在历史轮次中已绑定到不同摘要 %s", row, ref.URI, old)})
+			}
+			if old, ok := digestURI[ref.SHA256]; ok && old != ref.URI {
+				issues = append(issues, ValidationIssue{Code: "cross_run_digest_conflict", Field: "events.evidence_refs", Row: row, Message: fmt.Sprintf("第 %d 项事件的证据摘要 %s 在历史轮次中已绑定到不同 URI %s", row, ref.SHA256, old)})
+			}
+		}
+	}
+	if len(issues) > 0 {
+		return &ValidationError{Issues: issues}
+	}
+	return nil
+}

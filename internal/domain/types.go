@@ -187,6 +187,9 @@ func (c *ExerciseCase) AddRun(run ExerciseRun) error {
 	if err := ValidateRun(*c.Protocol, run); err != nil {
 		return err
 	}
+	if err := c.validateCrossRunEvidence(run); err != nil {
+		return err
+	}
 	run.CaseID = c.CaseID
 	c.Runs = append(c.Runs, run)
 	c.touch()

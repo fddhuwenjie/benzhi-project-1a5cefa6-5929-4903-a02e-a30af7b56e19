@@ -42,13 +42,17 @@ func result(c *domain.ExerciseCase, msg string) CommandResult {
 	return CommandResult{CaseID: c.CaseID, Revision: c.Revision, Status: c.Status, Message: msg}
 }
 func (s *Service) execute(id string, meta Meta, command any, successStatus int, mutate func(*store.Snapshot) (CommandResult, error)) (CommandResult, error) {
+	return s.executeWithPreCommit(id, meta, command, successStatus, mutate, nil)
+}
+
+func (s *Service) executeWithPreCommit(id string, meta Meta, command any, successStatus int, mutate func(*store.Snapshot) (CommandResult, error), preCommit func(*store.Snapshot) (func(), error)) (CommandResult, error) {
 	unlock := s.coordinator.lock(id)
 	defer unlock()
 	if err := validateMeta(meta); err != nil {
 		return CommandResult{}, err
 	}
 	fp := store.Fingerprint(command)
-	_, err := s.store.WithCase(id, func(snap *store.Snapshot) ([]byte, bool, error) {
+	_, err := s.store.WithCaseTx(id, func(snap *store.Snapshot) ([]byte, bool, error) {
 		if old, ok := snap.Requests[meta.RequestID]; ok {
 			if old.Fingerprint != fp {
 				summary := old.Summary
@@ -86,7 +90,7 @@ func (s *Service) execute(id string, meta Meta, command any, successStatus int, 
 			return nil, false, marshalErr
 		}
 		return auditPayload, true, nil
-	})
+	}, preCommit)
 	if err != nil {
 		return CommandResult{}, err
 	}
@@ -219,7 +223,7 @@ func (s *Service) Correct(id string, cmd CorrectCommand) (CommandResult, error) 
 	})
 }
 func (s *Service) Review(id string, cmd ReviewCommand) (CommandResult, error) {
-	out, err := s.execute(id, cmd.Meta, cmd, 200, func(snap *store.Snapshot) (CommandResult, error) {
+	return s.executeWithPreCommit(id, cmd.Meta, cmd, 200, func(snap *store.Snapshot) (CommandResult, error) {
 		c := snap.Case
 		if c == nil {
 			return CommandResult{}, &NotFoundError{ID: id}
@@ -248,17 +252,16 @@ func (s *Service) Review(id string, cmd ReviewCommand) (CommandResult, error) {
 		out := result(c, "复核结论已封存")
 		out.Summary = readiness.ChecklistDigest
 		return out, nil
+	}, func(snap *store.Snapshot) (func(), error) {
+		if snap.Case == nil || snap.Case.Certificate == nil {
+			return nil, nil
+		}
+		path := store.CertificatePath(s.store.Root(), snap.Case.Certificate.CertificateID)
+		if saveErr := s.store.SaveCertificate(snap.Case.Certificate); saveErr != nil {
+			return nil, saveErr
+		}
+		return func() { os.Remove(path) }, nil
 	})
-	if err == nil && out.Status == domain.StatusQualified {
-		c, getErr := s.Get(id)
-		if getErr != nil {
-			return out, getErr
-		}
-		if saveErr := s.store.SaveCertificate(c.Certificate); saveErr != nil {
-			return out, saveErr
-		}
-	}
-	return out, err
 }
 
 func (s *Service) ReviewReadiness(id, reviewer string) (qualification.ReviewReadiness, error) {

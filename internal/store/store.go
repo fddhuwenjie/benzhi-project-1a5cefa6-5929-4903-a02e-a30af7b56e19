@@ -32,6 +32,7 @@ func New(root string) (*Store, error) {
 func (s *Store) caseLock(id string) *sync.Mutex {
 	return s.locks.forCase(id)
 }
+func (s *Store) Root() string { return s.root }
 func safeID(id string) error {
 	if id == "" || strings.Contains(id, "/") || strings.Contains(id, "\\") || strings.Contains(id, "..") {
 		return errors.New("标识无效")
@@ -61,6 +62,17 @@ func (s *Store) Load(id string) (*Snapshot, error) {
 	return &snap, nil
 }
 func (s *Store) WithCase(id string, fn func(*Snapshot) ([]byte, bool, error)) ([]byte, error) {
+	return s.WithCaseTx(id, fn, nil)
+}
+
+// WithCaseTx behaves like WithCase but additionally runs preCommit (when non-nil)
+// after the audit frame has been appended and the case head/certificate sealed and
+// before the snapshot is written. preCommit may return a rollback function for any
+// side effect it performed; that rollback is invoked if the subsequent snapshot
+// write fails. If preCommit returns an error, the appended audit frame is rolled
+// back so the case stays in its prior committed state and the same request can be
+// retried.
+func (s *Store) WithCaseTx(id string, fn func(*Snapshot) ([]byte, bool, error), preCommit func(*Snapshot) (func(), error)) ([]byte, error) {
 	if err := safeID(id); err != nil {
 		return nil, err
 	}
@@ -83,6 +95,11 @@ func (s *Store) WithCase(id string, fn func(*Snapshot) ([]byte, bool, error)) ([
 	if snap.Case == nil {
 		return nil, errors.New("案件快照为空")
 	}
+	auditPath := s.auditPath(id)
+	prevSize, prevExists, statErr := fileSize(auditPath)
+	if statErr != nil {
+		return nil, statErr
+	}
 	head, err := s.appendAudit(id, payload)
 	if err != nil {
 		return nil, err
@@ -91,10 +108,42 @@ func (s *Store) WithCase(id string, fn func(*Snapshot) ([]byte, bool, error)) ([
 	if snap.Case.Certificate != nil {
 		snap.Case.Certificate.SealAuditHead(head)
 	}
+	var rollbackSideEffect func()
+	if preCommit != nil {
+		rollbackSideEffect, err = preCommit(snap)
+		if err != nil {
+			rollbackAudit(auditPath, prevSize, prevExists)
+			return nil, err
+		}
+	}
 	if err = s.writeSnapshot(id, snap); err != nil {
+		rollbackAudit(auditPath, prevSize, prevExists)
+		if rollbackSideEffect != nil {
+			rollbackSideEffect()
+		}
 		return nil, err
 	}
 	return payload, nil
+}
+
+func fileSize(path string) (int64, bool, error) {
+	info, err := os.Stat(path)
+	if err == nil {
+		return info.Size(), true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, false, nil
+	}
+	return 0, false, err
+}
+
+// rollbackAudit restores the audit file to the state preceding an appended frame.
+func rollbackAudit(auditPath string, prevSize int64, prevExists bool) {
+	if prevExists {
+		_ = os.Truncate(auditPath, prevSize)
+	} else {
+		_ = os.Remove(auditPath)
+	}
 }
 func (s *Store) writeSnapshot(id string, snap *Snapshot) error {
 	b, err := json.MarshalIndent(snap, "", "  ")
